@@ -288,6 +288,179 @@ def test_reservation_naive_datetime_treated_as_utc(client):
 
 
 # ---------------------------------------------------------------------------
+# 预约改期 PATCH /reservations/{id}/schedule
+# ---------------------------------------------------------------------------
+
+
+def _reschedule(client, rid, from_, to):
+    return client.patch(
+        f"/reservations/{rid}/schedule",
+        json={"allowed_departure_from": from_, "allowed_departure_to": to},
+    )
+
+
+def test_reschedule_success_keeps_identity_and_updates_schedule(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)  # 排定 00:36–01:36
+    before = client.get(f"/ports/{port_id}/reservations").json()[0]
+
+    # 改到 02:00 之后出发：新范围内无其他预约，最早 02:00
+    r = _reschedule(client, rid, "2026-09-24T02:00:00Z", "2026-09-24T04:24:00Z")
+    assert r.status_code == 200
+    body = r.json()
+    # 预约 ID、船名、创建时间保持不变
+    assert body["id"] == rid
+    assert body["ship_name"] == before["ship_name"]
+    assert body["created_at"] == before["created_at"]
+    assert body["status"] == "active"
+    assert body["canceled_at"] is None
+    # 允许范围与通航起止已更新
+    assert body["allowed_departure_from"] == "2026-09-24T02:00:00+00:00"
+    assert body["allowed_departure_to"] == "2026-09-24T04:24:00+00:00"
+    assert body["departure_start"] == "2026-09-24T02:00:00+00:00"
+    assert body["departure_end"] == "2026-09-24T03:00:00+00:00"
+    # 吃水、安全富余、通航时长沿用原预约
+    assert body["draft"] == 5.0
+    assert body["safety_margin"] == 0.5
+    assert body["duration_minutes"] == 60.0
+
+
+def test_reschedule_excludes_own_original_occupation(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)  # 原占用 00:36–01:36
+    # 新范围与原占用重叠：自身原占用不参与阻挡，仍可排回 00:36
+    r = _reschedule(client, rid, "2026-09-24T00:00:00Z", "2026-09-24T01:00:00Z")
+    assert r.status_code == 200
+    assert r.json()["departure_start"] == "2026-09-24T00:36:00+00:00"
+    assert r.json()["departure_end"] == "2026-09-24T01:36:00+00:00"
+
+
+def test_reschedule_respects_other_reservations_touching_allowed(client):
+    port_id = _setup_port(client)
+    rid1 = _create_reservation(client, port_id)  # 00:36–01:36
+    rid2 = _create_reservation(client, port_id)  # 01:36–02:36
+    # 第一条改到 01:00 之后：01:36–02:36 被第二条占用，
+    # 最早可紧随其后 02:36 出发（首尾相接允许）
+    r = _reschedule(client, rid1, "2026-09-24T01:00:00Z", "2026-09-24T04:24:00Z")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["departure_start"] == "2026-09-24T02:36:00+00:00"
+    assert body["departure_end"] == "2026-09-24T03:36:00+00:00"
+    # 第二条不受影响
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    other = [x for x in listed if x["id"] == rid2][0]
+    assert other["departure_start"] == "2026-09-24T01:36:00+00:00"
+
+
+def test_reschedule_uses_latest_forecast(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    # 更正高潮点 3.0 → 2.0：水深 5.0→6.5→5.0，可出发时段变为 [01:00, 04:00]
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 2.0}]},
+    )
+    r = _reschedule(client, rid, "2026-09-24T00:00:00Z", "2026-09-24T06:00:00Z")
+    assert r.status_code == 200
+    # 按请求时最新预报重算：最早 01:00（原预报下为 00:36）
+    assert r.json()["departure_start"] == "2026-09-24T01:00:00+00:00"
+    assert r.json()["departure_end"] == "2026-09-24T02:00:00+00:00"
+
+
+def test_reschedule_409_outside_coverage_keeps_original(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    before = client.get(f"/ports/{port_id}/reservations").json()[0]
+    # 新范围完全在预报覆盖时段（00:00–06:00）之外 → 无可行时刻
+    r = _reschedule(client, rid, "2026-09-24T07:00:00Z", "2026-09-24T08:00:00Z")
+    assert r.status_code == 409
+    # 原排程与允许范围保持不变
+    after = client.get(f"/ports/{port_id}/reservations").json()
+    assert after == [before]
+
+
+def test_reschedule_409_when_blocked_by_others_keeps_original(client):
+    port_id = _setup_port(client)
+    rid1 = _create_reservation(client, port_id)  # 00:36–01:36
+    _create_reservation(client, port_id)         # 01:36–02:36
+    before = client.get(f"/ports/{port_id}/reservations").json()
+    # 第一条改到 [01:00, 02:00]：整段落在第二条封禁区间内 → 409
+    r = _reschedule(client, rid1, "2026-09-24T01:00:00Z", "2026-09-24T02:00:00Z")
+    assert r.status_code == 409
+    after = client.get(f"/ports/{port_id}/reservations").json()
+    assert after == before
+
+
+def test_reschedule_cancelled_reservation_409(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    assert client.delete(f"/reservations/{rid}").status_code == 200
+    r = _reschedule(client, rid, "2026-09-24T00:00:00Z", "2026-09-24T04:24:00Z")
+    assert r.status_code == 409
+
+
+def test_reschedule_unknown_reservation_404(client):
+    assert _reschedule(
+        client, 999, "2026-09-24T00:00:00Z", "2026-09-24T04:24:00Z"
+    ).status_code == 404
+
+
+def test_reschedule_validation_errors(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    # 允许出发范围起止颠倒 → 422
+    r = _reschedule(client, rid, "2026-09-24T04:24:00Z", "2026-09-24T00:00:00Z")
+    assert r.status_code == 422
+    # 缺少字段 / 空请求体 → 422
+    assert client.patch(f"/reservations/{rid}/schedule", json={}).status_code == 422
+
+
+def test_reschedule_naive_datetime_treated_as_utc(client):
+    port_id = _setup_port(client)
+    rid = _create_reservation(client, port_id)
+    r = _reschedule(
+        client,
+        rid,
+        "2026-09-24T02:00:00",   # 无时区 → UTC
+        "2026-09-24T04:24:00",
+    )
+    assert r.status_code == 200
+    assert r.json()["departure_start"] == "2026-09-24T02:00:00+00:00"
+
+
+def test_concurrent_reschedules_never_double_book(client):
+    port_id = _setup_port(client)
+    rid1 = _create_reservation(client, port_id)  # 00:36–01:36
+    rid2 = _create_reservation(client, port_id)  # 01:36–02:36
+    results: list = []
+    errors: list = []
+
+    def worker(rid):
+        try:
+            r = _reschedule(client, rid, "2026-09-24T02:00:00Z", "2026-09-24T04:24:00Z")
+            results.append(r)
+        except Exception as exc:  # pragma: no cover - 并发不应抛出异常
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(rid,)) for rid in (rid1, rid2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert [r.status_code for r in results] == [200, 200]
+    intervals = sorted(
+        (r.json()["departure_start"], r.json()["departure_end"]) for r in results
+    )
+    # 两条改期到同一范围：串行化 + 写事务保证不重叠（首尾相接允许）
+    assert intervals[0][1] <= intervals[1][0]
+    # 均落在新的允许出发范围内
+    assert intervals[0][0] >= "2026-09-24T02:00:00+00:00"
+    assert intervals[1][0] <= "2026-09-24T04:24:00+00:00"
+
+
+# ---------------------------------------------------------------------------
 # 预约水深复核 GET /reservations/{id}/depth-audit
 # ---------------------------------------------------------------------------
 

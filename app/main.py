@@ -7,6 +7,10 @@
 - 单向航道预约：在请求的允许出发范围内，按最新预报安排最早出发时刻，
   整个通航过程不与该港口有效预约重叠（首尾相接允许）；无可用时刻返回 409；
   已落库预约记录确定时刻，预报更正不追溯调整/取消已有预约。
+- 预约改期：只提交新的允许出发起止时刻，沿用原预约的吃水、安全富余与
+  通航时长；以请求时最新预报重算通航窗口，同港有效预约中排除该预约原占用，
+  选出新范围内不与其他占用重叠的最早出发时刻（首尾相接允许）；排程检查与
+  更新在同一写事务内完成，无可行时刻返回 409 且保留原排程与允许范围。
 - 预约水深复核：按查询时最新预报复算预约排定通航区间的水深，合并返回
   欠深时段及各段最大欠深；预报未覆盖整个通航区间时明确返回未覆盖时段，
   不判为安全；复核只读，不改动预约或原排程。
@@ -48,6 +52,7 @@ from .schemas import (
     PortUpdate,
     ReservationCreate,
     ReservationOut,
+    ReservationScheduleUpdate,
     TideForecastOut,
     TideForecastUpsert,
     TideObservationOut,
@@ -73,7 +78,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -395,13 +400,23 @@ def _reservation_from_row(row) -> ReservationOut:
     )
 
 
-def _active_blockers(db: Connection, port_id: int) -> list[tuple[datetime, datetime]]:
-    """读取该港口全部有效（未取消）预约的通航占用区间。"""
-    rows = db.execute(
+def _active_blockers(
+    db: Connection, port_id: int, exclude_id: int | None = None
+) -> list[tuple[datetime, datetime]]:
+    """读取该港口全部有效（未取消）预约的通航占用区间。
+
+    exclude_id：改期场景下排除该预约自身，其原占用不再阻挡新排程。
+    """
+    query = (
         "SELECT departure_start, departure_end FROM reservations "
-        "WHERE port_id = ? AND status = ? ORDER BY departure_start",
-        (port_id, _STATUS_ACTIVE),
-    ).fetchall()
+        "WHERE port_id = ? AND status = ?"
+    )
+    params: list = [port_id, _STATUS_ACTIVE]
+    if exclude_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_id)
+    query += " ORDER BY departure_start"
+    rows = db.execute(query, params).fetchall()
     return [
         (
             datetime.fromisoformat(r["departure_start"]),
@@ -516,6 +531,89 @@ def cancel_reservation(reservation_id: int, db: Connection = Depends(get_db)):
         "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
     ).fetchone()
     return _reservation_from_row(row)
+
+
+@app.patch("/reservations/{reservation_id}/schedule", response_model=ReservationOut)
+def reschedule_reservation(
+    reservation_id: int,
+    payload: ReservationScheduleUpdate,
+    db: Connection = Depends(get_db),
+):
+    """预约改期：只提交新的允许出发起止时刻，沿用原预约的吃水、安全富余与通航时长。
+
+    以请求时**最新预报**重算潮汐可出发时段，同港有效预约中**排除该预约
+    自身原占用**，在新允许范围内安排不与其他占用重叠的最早出发时刻
+    （首尾相接允许）。排程检查与更新在同一写事务内完成；无可行时刻返回
+    409 且保留原排程与允许范围；已取消预约不能改期。
+    """
+    allowed_from = _normalize(payload.allowed_departure_from)
+    allowed_to = _normalize(payload.allowed_departure_to)
+
+    # 先读出港口以便按港串行化；预约存在性与状态在写事务内还会再校验
+    row = db.execute(
+        "SELECT port_id FROM reservations WHERE id = ?", (reservation_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"预约 {reservation_id} 不存在")
+    port_id = row["port_id"]
+
+    # 同港先在进程内排队，再在写事务内原子地“检查 + 更新”
+    with port_lock(port_id):
+        with locked_reservation_tx() as tx:
+            row = tx.execute(
+                "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"预约 {reservation_id} 不存在")
+            if row["status"] != _STATUS_ACTIVE:
+                raise HTTPException(
+                    status_code=409, detail=f"预约 {reservation_id} 已取消，不能改期"
+                )
+            port = _get_port_or_404(tx, port_id)
+            points = _forecast_points(tx, port_id)
+            required_depth = row["draft"] + row["safety_margin"]
+            duration_seconds = row["duration_minutes"] * 60
+            tide_windows, _ = departure_windows(
+                points,
+                reference_depth=port["reference_depth"],
+                required_depth=required_depth,
+                duration_seconds=duration_seconds,
+            )
+            # 排除该预约自身原占用，其余有效预约仍阻挡新排程
+            blockers = _active_blockers(tx, port_id, exclude_id=reservation_id)
+            departure = earliest_scheduled_departure(
+                tide_windows,
+                duration_seconds=duration_seconds,
+                allowed_start=allowed_from,
+                allowed_end=allowed_to,
+                blockers=blockers,
+            )
+            if departure is None:
+                # 无可行时刻：事务回滚，原排程与允许范围保持不变
+                raise HTTPException(
+                    status_code=409,
+                    detail="新的允许出发范围内无可用时刻（潮高不足或与现有预约冲突），已保留原排程",
+                )
+            arrival = departure + timedelta(seconds=duration_seconds)
+            tx.execute(
+                """
+                UPDATE reservations
+                SET allowed_departure_from = ?, allowed_departure_to = ?,
+                    departure_start = ?, departure_end = ?
+                WHERE id = ?
+                """,
+                (
+                    allowed_from.isoformat(),
+                    allowed_to.isoformat(),
+                    departure.isoformat(),
+                    arrival.isoformat(),
+                    reservation_id,
+                ),
+            )
+            row = tx.execute(
+                "SELECT * FROM reservations WHERE id = ?", (reservation_id,)
+            ).fetchone()
+            return _reservation_from_row(row)
 
 
 @app.get("/reservations/{reservation_id}/depth-audit", response_model=DepthAuditResult)
