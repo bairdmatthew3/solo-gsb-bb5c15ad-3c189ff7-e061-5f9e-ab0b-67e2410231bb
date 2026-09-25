@@ -141,6 +141,25 @@ class ReservationCreate(BaseModel):
         return self
 
 
+class ReservationReschedule(BaseModel):
+    """预约改期请求：只提供新的允许出发起止时刻，其余沿用原预约。"""
+
+    allowed_departure_from: datetime = Field(description="新的允许出发范围起点（ISO 8601；无时区信息按 UTC）")
+    allowed_departure_to: datetime = Field(description="新的允许出发范围终点（ISO 8601；无时区信息按 UTC）")
+
+    @model_validator(mode="after")
+    def _validate_range(self):
+        start = self.allowed_departure_from
+        end = self.allowed_departure_to
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if start > end:
+            raise ValueError("allowed_departure_from 不得晚于 allowed_departure_to")
+        return self
+
+
 class ReservationOut(BaseModel):
     id: int
     port_id: int

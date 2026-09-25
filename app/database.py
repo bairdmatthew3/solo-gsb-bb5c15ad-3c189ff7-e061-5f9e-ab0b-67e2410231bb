@@ -15,7 +15,7 @@ from typing import Iterator
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "tide.db")
 
-# 同港预约并发创建时，进程内先按港口串行化，再由 BEGIN IMMEDIATE
+# 同港预约并发创建/改期时，进程内先按港口串行化，再由 BEGIN IMMEDIATE
 # 保证跨进程/跨连接的原子性，避免双重占用。
 _port_locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
 
@@ -98,9 +98,9 @@ def get_db():
 
 @contextmanager
 def locked_reservation_tx() -> Iterator[sqlite3.Connection]:
-    """预约创建专用：以 BEGIN IMMEDIATE 立即获取写锁的事务连接。
+    """预约创建/改期专用：以 BEGIN IMMEDIATE 立即获取写锁的事务连接。
 
-    检查（最新预报 + 有效预约）与插入在同一写事务内完成，
+    检查（最新预报 + 有效预约）与写入在同一写事务内完成，
     提交前其他连接无法开始写事务，从而原子地避免双重占用；
     busy_timeout 使并发请求排队等待而非立即报 SQLITE_BUSY。
     """
